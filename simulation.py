@@ -1,5 +1,5 @@
 # simulation.py
-import streamlit as st
+import streamlit
 import io
 import pandas as pd
 import math
@@ -271,7 +271,7 @@ def run_simulation(
     # Inside your Streamlit code:
     excel_data = to_excel(req_pivot)
 
-    st.download_button(
+    streamlit.download_button(
         label="📥 Download req_pivot.xlsx",
         data=excel_data,
         file_name="req_pivot.xlsx",
