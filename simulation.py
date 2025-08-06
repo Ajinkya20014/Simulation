@@ -1,5 +1,5 @@
 # simulation.py
-
+import streamlit as st
 import pandas as pd
 import math
 
@@ -260,6 +260,7 @@ def run_simulation(
     req_pivot = lg_daily_req.pivot_table(index="LG_ID", columns="Day",
                                          values="Daily_Requirement_tons",
                                          aggfunc="sum", fill_value=0.0)
+    st.write("CG→LG Daily Requirements", req_pivot)
 
     # -----------------------------------------------
     # 5) CG → LG PRE-DISPATCH (same DAYS timeline)
