@@ -277,8 +277,8 @@ def run_simulation(
         file_name="req_pivot.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-    excel_raw_data = to_excel(lg_daily_req, sheet_name="LG_Daily_Req")
-    st.download_button(
+    excel_raw_data = to_excel(lg_daily_req)
+    streamlit.download_button(
         label="📥 Download lg_daily_req.xlsx",
         data=excel_raw_data,
         file_name="lg_daily_req.xlsx",
