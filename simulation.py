@@ -1,5 +1,6 @@
 # simulation.py
 import streamlit as st
+import io
 import pandas as pd
 import math
 
@@ -260,8 +261,22 @@ def run_simulation(
     req_pivot = lg_daily_req.pivot_table(index="LG_ID", columns="Day",
                                          values="Daily_Requirement_tons",
                                          aggfunc="sum", fill_value=0.0)
-    st.write("CG→LG Daily Requirements", req_pivot)
 
+    def to_excel(df):
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=True, sheet_name='Req_Pivot')
+        return output.getvalue()
+
+    # Inside your Streamlit code:
+    excel_data = to_excel(req_pivot)
+
+    st.download_button(
+        label="📥 Download req_pivot.xlsx",
+        data=excel_data,
+        file_name="req_pivot.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
     # -----------------------------------------------
     # 5) CG → LG PRE-DISPATCH (same DAYS timeline)
     # -----------------------------------------------
