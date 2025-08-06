@@ -277,7 +277,7 @@ def run_simulation(
         capacity = {int(r["LG_ID"]): float(r["Storage_Capacity_tons"]) for _, r in lgs.iterrows()}
 
     # start CG stocks at current LG stock (or 0 if you prefer fresh inflow)
-    lg_stock_cg = {int(r["LG_ID"]): float(r.get("Initial_Allocation_tons", 0.0)) for _, r in lgs.iterrows()}
+    lg_stock_cg = {int(r["LG_ID"]): float(r.get("Initial_LG_stock", 0.0)) for _, r in lgs.iterrows()}
 
     dispatch_cg_rows = []
 
