@@ -423,8 +423,8 @@ def run_simulation(
     assert ok
 
     dispatch_cg = pd.DataFrame(rows, columns=["Day", "Vehicle_ID", "LG_ID", "Quantity_tons"])
-    .sort_values(
-        by=["Day", "Vehicle_ID", "LG_ID"], kind="mergesort"
-    ).reset_index(drop=True)
+    # .sort_values(
+    #     by=["Day", "Vehicle_ID", "LG_ID"], kind="mergesort"
+    # ).reset_index(drop=True)
 
     return dispatch_cg, dispatch_lg, stock_levels
