@@ -258,9 +258,11 @@ def run_simulation(
             .rename(columns={"Quantity_tons": "Daily_Requirement_tons"})
         )
 
-    req_pivot = lg_daily_req.pivot_table(index="LG_ID", columns="Day",
-                                         values="Daily_Requirement_tons",
-                                         aggfunc="sum", fill_value=0.0)
+    req_pivot = lg_daily_req.pivot_table(
+        index="LG_ID", columns="Day",
+        values="Daily_Requirement_tons",
+        aggfunc="sum", fill_value=0.0
+    )
 
     def to_excel(df):
         output = io.BytesIO()
@@ -308,31 +310,43 @@ def run_simulation(
         return max(0.0, capacity.get(lg_id, 0.0) - lg_stock_cg.get(lg_id, 0.0))
 
     for day in range(1, DAYS + 1):
-        trips_left = TOT_V
+    trips_left = TOT_V
 
-        # Serve today's requirement first for each LG
-        for lgid in req_pivot.index:
-            need_today = max(0.0, float(req_pivot.at[lgid, day]) - lg_stock_cg.get(lgid, 0.0))
-            # ship in trips while we still need and have trips
-            while trips_left > 0 and need_today > 1e-9:
-                # assign a simple rotating vehicle id 1..TOT_V
-                vid = TOT_V - trips_left + 1
-                qty = min(TRUCK_CAP, need_today, free_room(lgid))
-                if qty <= 1e-9:
-                    break
-                dispatch_cg_rows.append({
-                    "Day": int(day),
-                    "Vehicle_ID": int(vid),
-                    "LG_ID": int(lgid),
-                    "Quantity_tons": float(qty)
-                })
-                lg_stock_cg[lgid] = lg_stock_cg.get(lgid, 0.0) + qty
-                trips_left -= 1
-                need_today -= qty
+    for lgid in req_pivot.index:
+        # --- 1) Get today's demand safely
+        try:
+            demand_today = float(req_pivot.at[lgid, day])
+        except Exception:
+            # treat missing as 0 (or raise if you prefer strictness)
+            demand_today = 0.0
 
-        # Optional: If trips remain, you could pre-stock for future days (round-robin).
-        # Skipped here to keep logic minimal and strictly "no backlog on the day" as per your earlier constraints.
+        # --- 2) Ship to cover today's shortfall (before consumption)
+        stock_now = lg_stock_cg.get(lgid, 0.0)
+        need_today = max(0.0, demand_today - stock_now)
 
+        while trips_left > 0 and need_today > 1e-9:
+            vid = TOT_V - trips_left + 1  # 1..TOT_V each day
+            room = free_room(lgid)        # recomputed each iteration
+            if room <= 1e-9:
+                break
+
+            qty = min(TRUCK_CAP, need_today, room)
+            if qty <= 1e-9:
+                break
+
+            dispatch_cg_rows.append({
+                "Day": int(day),
+                "Vehicle_ID": int(vid),
+                "LG_ID": int(lgid),
+                "Quantity_tons": float(qty)
+            })
+            lg_stock_cg[lgid] = lg_stock_cg.get(lgid, 0.0) + qty
+            trips_left -= 1
+            need_today -= qty
+
+        # --- 3) End-of-day consumption at LG
+        # Consume exactly today's demand, not the residual 'need_today'
+        lg_stock_cg[lgid] = max(0.0, lg_stock_cg.get(lgid, 0.0) - demand_today)
     dispatch_cg = pd.DataFrame(dispatch_cg_rows, columns=["Day","Vehicle_ID","LG_ID","Quantity_tons"])
 
     return dispatch_cg, dispatch_lg, stock_levels
