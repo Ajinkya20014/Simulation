@@ -320,12 +320,14 @@ def run_simulation(
     def _free_room(stock: dict, lg_id: int) -> float:
         return max(0.0, capacity.get(lg_id, 0.0) - stock.get(lg_id, 0.0))
 
-    def _simulate(pre_days: int, collect_rows: bool = False):
+    def _simulate(pre_days: int, collect_rows: bool = False, include_pre_days: bool = False):
         """
         Runs the CG→LG simulation starting at day = 1 - pre_days.
-        - On days < 1: only pre-stock round-robin (no consumption).
+        - On days < 1: no consumption (pure pre-stocking).
         - On days >= 1: (A) cover today's need, (B) pre-stock with remaining trips, (C) consume.
-        If collect_rows=True, records ONLY Day 1..DAYS trips.
+        If collect_rows=True, records trips for:
+            - all days if include_pre_days=True (including 0, -1, -2, ...)
+            - only Day >= 1 if include_pre_days=False
         Returns: (feasible: bool, rows: list[dict], start_day: int, final_stock: dict)
         """
         start_day = 1 - pre_days
@@ -335,9 +337,8 @@ def run_simulation(
         for day in range(start_day, DAYS + 1):
             trips_left = TOT_V
 
-            # --- A) Serve today's demand first ---
+            # --- A) Serve today's demand first (only matters when day >= 1) ---
             if day >= 1:
-                # Greedy order by highest shortfall
                 order = sorted(lg_ids, key=lambda lg: -(_get_demand(lg, day) - stock[lg]))
                 for lg in order:
                     demand_today = _get_demand(lg, day)
@@ -351,8 +352,7 @@ def run_simulation(
                         if qty <= 1e-9:
                             break
 
-                        # Log only Day >= 1 (same-timeline output)
-                        if collect_rows and 1 <= day <= DAYS:
+                        if collect_rows and (include_pre_days or day >= 1):
                             vid = TOT_V - trips_left + 1
                             rows.append({
                                 "Day": int(day),
@@ -365,13 +365,11 @@ def run_simulation(
                         trips_left -= 1
                         need_today -= qty
 
-                    # If after all trips we still can't meet today's demand → infeasible
                     if stock[lg] + 1e-6 < demand_today:
                         return False, (rows or []), start_day, stock
 
             # --- B) Pre-stock round-robin with remaining trips ---
             if trips_left > 0:
-                # Future unmet from tomorrow..DAYS (or from Day 1 if we are still in pre-days)
                 future_unmet = {
                     lg: max(0.0, sum(_get_demand(lg, d) for d in range(max(1, day + 1), DAYS + 1)) - stock[lg])
                     for lg in lg_ids
@@ -384,8 +382,7 @@ def run_simulation(
                     deliver = min(TRUCK_CAP, future_unmet[lg], room)
 
                     if deliver > 1e-9:
-                        # Log only Day >= 1 (pre-days are collapsed into initial stock)
-                        if collect_rows and day >= 1:
+                        if collect_rows and (include_pre_days or day >= 1):
                             vid = TOT_V - trips_left + 1
                             rows.append({
                                 "Day": int(day),
@@ -402,7 +399,7 @@ def run_simulation(
                         idx -= 1
                     idx += 1
 
-            # --- C) End-of-day consumption ---
+            # --- C) End-of-day consumption (only Day >= 1) ---
             if day >= 1:
                 for lg in lg_ids:
                     stock[lg] = max(0.0, stock[lg] - _get_demand(lg, day))
@@ -410,7 +407,7 @@ def run_simulation(
         return True, (rows or []), start_day, stock
 
     # --- Find minimal pre_days (0..MAX_PRE_DAYS) that makes schedule feasible ---
-    MAX_PRE_DAYS = 30  # you can wire this to Settings
+    MAX_PRE_DAYS = 30  # wire to Settings if needed
     pre_days = None
     for x in range(0, MAX_PRE_DAYS + 1):
         ok, _, start_day, _ = _simulate(pre_days=x, collect_rows=False)
@@ -421,10 +418,13 @@ def run_simulation(
     if pre_days is None:
         raise RuntimeError("Unable to meet all demands within MAX_PRE_DAYS.")
 
-    # --- Re-run with logging (rows only for Day 1..DAYS; pre-days collapsed) ---
-    ok, rows, start_day, _ = _simulate(pre_days=pre_days, collect_rows=True)
+    # --- Re-run with logging; include pre-days in output ---
+    ok, rows, start_day, _ = _simulate(pre_days=pre_days, collect_rows=True, include_pre_days=True)
     assert ok
 
     dispatch_cg = pd.DataFrame(rows, columns=["Day", "Vehicle_ID", "LG_ID", "Quantity_tons"])
+    .sort_values(
+        by=["Day", "Vehicle_ID", "LG_ID"], kind="mergesort"
+    ).reset_index(drop=True)
 
     return dispatch_cg, dispatch_lg, stock_levels
