@@ -401,41 +401,54 @@ def run_simulation(
     assert ok
 
     dispatch_cg = pd.DataFrame(rows, columns=["Day", "Vehicle_ID", "LG_ID", "Quantity_tons"])
+    # === Accurate LG stock levels (Day 1..DAYS) ===
+    # Stock(t) = init + cumulative(CG→LG up to t, incl. pre-days) − cumulative(LG→FPS up to t)
 
-        # --- Fix LG stock levels ---
-    # Initial stock (prefer Initial_LG_stock, else 0)
-    init_stock = lgs.set_index("LG_ID").get("Initial_LG_stock", pd.Series(0, index=lgs["LG_ID"])).fillna(0)
+    lg_ids_sorted = sorted(int(x) for x in valid_lg_ids)
 
-    # CG receipts cumulative
-    cg_daily = (
-        dispatch_cg.groupby(["LG_ID", "Day"])["Quantity_tons"].sum().unstack(fill_value=0)
-        if not dispatch_cg.empty else pd.DataFrame(0, index=lgs["LG_ID"], columns=range(1, DAYS+1))
-    )
-    cg_cum = cg_daily.cumsum(axis=1)
+    # Initial stock per LG (prefer Initial_LG_stock, else Initial_Allocation_tons, else 0)
+    if "Initial_LG_stock" in lgs.columns:
+        init_series = lgs.set_index("LG_ID")["Initial_LG_stock"].reindex(lg_ids_sorted).fillna(0.0)
+    elif "Initial_Allocation_tons" in lgs.columns:
+        init_series = lgs.set_index("LG_ID")["Initial_Allocation_tons"].reindex(lg_ids_sorted).fillna(0.0)
+    else:
+        init_series = pd.Series(0.0, index=lg_ids_sorted)
 
-    # LG→FPS dispatch cumulative
-    lg_daily = (
-        dispatch_lg.groupby(["LG_ID", "Day"])["Quantity_tons"].sum().unstack(fill_value=0)
-        if not dispatch_lg.empty else pd.DataFrame(0, index=lgs["LG_ID"], columns=range(1, DAYS+1))
-    )
-    lg_cum = lg_daily.cumsum(axis=1)
+    # CG receipts (include pre-days: start_day..DAYS), then keep 1..DAYS after cumsum
+    if not dispatch_cg.empty:
+        cg_piv = dispatch_cg.pivot_table(index="LG_ID", columns="Day",
+                                         values="Quantity_tons", aggfunc="sum", fill_value=0.0)
+        full_cols = list(range(start_day, DAYS + 1))  # includes negative/zero pre-days
+        cg_piv = cg_piv.reindex(index=lg_ids_sorted, columns=full_cols, fill_value=0.0)
+        cg_cum = cg_piv.cumsum(axis=1).reindex(columns=list(range(1, DAYS + 1)), fill_value=0.0)
+    else:
+        cg_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
 
-    # Stock = init + receipts − dispatches
-    stock_lg = cg_cum.sub(lg_cum, fill_value=0).add(init_stock, axis=0)
+    # LG→FPS dispatch (only days 1..DAYS exist)
+    if not dispatch_lg.empty:
+        lg_piv = dispatch_lg.pivot_table(index="LG_ID", columns="Day",
+                                         values="Quantity_tons", aggfunc="sum", fill_value=0.0)
+        lg_piv = lg_piv.reindex(index=lg_ids_sorted, columns=list(range(1, DAYS + 1)), fill_value=0.0)
+        lg_cum = lg_piv.cumsum(axis=1)
+    else:
+        lg_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
 
-    # Reshape into stock_levels rows for LG
-    stock_lg_rows = (
-        stock_lg.stack()
+    stock_matrix = init_series.to_numpy()[:, None] + cg_cum.to_numpy() - lg_cum.to_numpy()
+
+    lg_stock_levels = (
+        pd.DataFrame(stock_matrix, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
+        .stack()
+        .rename("Stock_Level_tons")
+        .rename_axis(index=["LG_ID", "Day"])
         .reset_index()
-        .rename(columns={"LG_ID": "Entity_ID", "Day": "Day", 0: "Stock_Level_tons"})
+        .rename(columns={"LG_ID": "Entity_ID"})
         .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
     )
 
-    # Keep existing FPS rows, replace LG rows
-    stock_levels = pd.concat([stock_levels[stock_levels["Entity_Type"] == "FPS"], stock_lg_rows], ignore_index=True)
-
-    # .sort_values(
-    #     by=["Day", "Vehicle_ID", "LG_ID"], kind="mergesort"
-    # ).reset_index(drop=True)
+    # Replace LG rows in stock_levels; keep FPS rows as-is
+    stock_levels = pd.concat(
+        [stock_levels[stock_levels["Entity_Type"] == "FPS"], lg_stock_levels],
+        ignore_index=True
+    )
 
     return dispatch_cg, dispatch_lg, stock_levels
