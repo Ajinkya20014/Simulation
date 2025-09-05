@@ -35,9 +35,11 @@ def load_inputs(path):
     lgs      = pd.read_excel(path, sheet_name="LGs")
     fps      = pd.read_excel(path, sheet_name="FPS")
     try:
-        vehicles = pd.read_excel(path, sheet_name="Vehicles")
+        vehicles = pd.read_excel(path, sheet_name="Vehicles", dtype={"Mapped_LG_IDs": "string"})
     except ValueError:
         vehicles = pd.DataFrame(columns=["Vehicle_ID", "Capacity_tons", "Mapped_LG_IDs"])
+    if "Mapped_LG_IDs" in vehicles.columns:
+        vehicles["Mapped_LG_IDs"] = vehicles["Mapped_LG_IDs"].astype("string")
     return settings, lgs, fps, vehicles
 
 settings, lgs, fps, vehicles = load_inputs(master)
