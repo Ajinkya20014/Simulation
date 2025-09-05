@@ -264,28 +264,6 @@ def run_simulation(
         aggfunc="sum", fill_value=0.0
     )
 
-    def to_excel(df):
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=True, sheet_name='Req_Pivot')
-        return output.getvalue()
-
-    # Inside your Streamlit code:
-    excel_data = to_excel(req_pivot)
-
-    streamlit.download_button(
-        label="📥 Download req_pivot.xlsx",
-        data=excel_data,
-        file_name="req_pivot.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-    excel_raw_data = to_excel(lg_daily_req)
-    streamlit.download_button(
-        label="📥 Download lg_daily_req.xlsx",
-        data=excel_raw_data,
-        file_name="lg_daily_req.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
     # -----------------------------------------------
     # 5) CG → LG PRE-DISPATCH (same DAYS timeline)
     # -----------------------------------------------
