@@ -401,6 +401,39 @@ def run_simulation(
     assert ok
 
     dispatch_cg = pd.DataFrame(rows, columns=["Day", "Vehicle_ID", "LG_ID", "Quantity_tons"])
+
+        # --- Fix LG stock levels ---
+    # Initial stock (prefer Initial_LG_stock, else 0)
+    init_stock = lgs.set_index("LG_ID").get("Initial_LG_stock", pd.Series(0, index=lgs["LG_ID"])).fillna(0)
+
+    # CG receipts cumulative
+    cg_daily = (
+        dispatch_cg.groupby(["LG_ID", "Day"])["Quantity_tons"].sum().unstack(fill_value=0)
+        if not dispatch_cg.empty else pd.DataFrame(0, index=lgs["LG_ID"], columns=range(1, DAYS+1))
+    )
+    cg_cum = cg_daily.cumsum(axis=1)
+
+    # LG→FPS dispatch cumulative
+    lg_daily = (
+        dispatch_lg.groupby(["LG_ID", "Day"])["Quantity_tons"].sum().unstack(fill_value=0)
+        if not dispatch_lg.empty else pd.DataFrame(0, index=lgs["LG_ID"], columns=range(1, DAYS+1))
+    )
+    lg_cum = lg_daily.cumsum(axis=1)
+
+    # Stock = init + receipts − dispatches
+    stock_lg = cg_cum.sub(lg_cum, fill_value=0).add(init_stock, axis=0)
+
+    # Reshape into stock_levels rows for LG
+    stock_lg_rows = (
+        stock_lg.stack()
+        .reset_index()
+        .rename(columns={"LG_ID": "Entity_ID", "Day": "Day", 0: "Stock_Level_tons"})
+        .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
+    )
+
+    # Keep existing FPS rows, replace LG rows
+    stock_levels = pd.concat([stock_levels[stock_levels["Entity_Type"] == "FPS"], stock_lg_rows], ignore_index=True)
+
     # .sort_values(
     #     by=["Day", "Vehicle_ID", "LG_ID"], kind="mergesort"
     # ).reset_index(drop=True)
