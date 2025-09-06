@@ -401,7 +401,8 @@ def run_simulation(
     assert ok
 
     dispatch_cg = pd.DataFrame(rows, columns=["Day", "Vehicle_ID", "LG_ID", "Quantity_tons"])
-    # === Accurate LG stock levels (Day 1..DAYS) ===
+
+        # === Accurate LG stock levels (Day 1..DAYS) ===
     # Stock(t) = init + cumulative(CG→LG up to t, incl. pre-days) − cumulative(LG→FPS up to t)
 
     lg_ids_sorted = sorted(int(x) for x in valid_lg_ids)
@@ -434,6 +435,9 @@ def run_simulation(
         lg_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
 
     stock_matrix = init_series.to_numpy()[:, None] + cg_cum.to_numpy() - lg_cum.to_numpy()
+    eps = 1e-9
+    stock_matrix = np.where(np.abs(stock_matrix) < eps, 0.0, stock_matrix)
+
 
     lg_stock_levels = (
         pd.DataFrame(stock_matrix, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
@@ -450,5 +454,4 @@ def run_simulation(
         [stock_levels[stock_levels["Entity_Type"] == "FPS"], lg_stock_levels],
         ignore_index=True
     )
-
     return dispatch_cg, dispatch_lg, stock_levels
