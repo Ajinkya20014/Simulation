@@ -3,6 +3,7 @@ import streamlit
 import io
 import pandas as pd
 import math
+import np
 
 def run_simulation(
     master_workbook,          # str path or file-like buffer
