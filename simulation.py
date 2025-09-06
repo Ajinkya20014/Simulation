@@ -3,6 +3,7 @@ import streamlit
 import io
 import pandas as pd
 import math
+import numpy as np
 
 def run_simulation(
     master_workbook,          # str path or file-like buffer
@@ -401,8 +402,86 @@ def run_simulation(
     assert ok
 
     dispatch_cg = pd.DataFrame(rows, columns=["Day", "Vehicle_ID", "LG_ID", "Quantity_tons"])
-    # .sort_values(
-    #     by=["Day", "Vehicle_ID", "LG_ID"], kind="mergesort"
-    # ).reset_index(drop=True)
+    # === Accurate LG stock levels: init + cumulative(CG→LG incl. pre-days) − cumulative(LG→FPS) ===
+    # Robust to empty dfs + dtype mismatches; does not rely on req_pivot.
+
+    # LG universe & init (INT-aligned)
+    lg_ids_sorted = sorted(int(x) for x in lgs["LG_ID"].dropna().astype(int).unique())
+
+    if "Initial_LG_stock" in lgs.columns:
+        init_series = (
+            lgs.assign(LG_ID=lgs["LG_ID"].astype(int))
+               .set_index("LG_ID")["Initial_LG_stock"]
+               .reindex(lg_ids_sorted).fillna(0.0)
+        )
+    else:
+        init_series = pd.Series(0.0, index=lg_ids_sorted)
+
+    # CG receipts cumulative (include pre-days start_day..DAYS → then keep 1..DAYS)
+    if not dispatch_cg.empty:
+        dcg = dispatch_cg.copy()
+        dcg["LG_ID"] = dcg["LG_ID"].astype(int)
+        dcg["Day"]   = dcg["Day"].astype(int)
+        cg_piv = dcg.pivot_table(index="LG_ID", columns="Day",
+                                 values="Quantity_tons", aggfunc="sum", fill_value=0.0)
+        full_cols = list(range(start_day, DAYS + 1))  # includes negative/zero pre-days
+        cg_piv = cg_piv.reindex(index=lg_ids_sorted, columns=full_cols, fill_value=0.0)
+        cg_cum = cg_piv.cumsum(axis=1).reindex(columns=list(range(1, DAYS + 1)), fill_value=0.0)
+    else:
+        cg_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
+
+    # LG→FPS dispatch cumulative (compute directly from dispatch_lg; do NOT rely on req_pivot)
+    if not dispatch_lg.empty:
+        dlg = dispatch_lg.copy()
+        dlg["LG_ID"] = dlg["LG_ID"].astype(int)
+        dlg["Day"]   = dlg["Day"].astype(int)
+        lg_piv = dlg.pivot_table(index="LG_ID", columns="Day",
+                                 values="Quantity_tons", aggfunc="sum", fill_value=0.0)
+        lg_piv = lg_piv.reindex(index=lg_ids_sorted, columns=list(range(1, DAYS + 1)), fill_value=0.0)
+        lg_cum = lg_piv.cumsum(axis=1)
+    else:
+        lg_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
+
+    # Stock = init + CG_cum − LG_cum  (eps clamp kills float fuzz)
+    stock_matrix = init_series.to_numpy()[:, None] + cg_cum.to_numpy() - lg_cum.to_numpy()
+    stock_matrix = np.where(np.abs(stock_matrix) < 1e-9, 0.0, stock_matrix)
+
+    # Tidy → LG rows; keep FPS rows intact
+    lg_stock_levels = (
+        pd.DataFrame(stock_matrix, index=lg_ids_sorted, columns=list(range(1, DAYS + 1)))
+          .stack().rename("Stock_Level_tons")
+          .rename_axis(index=["LG_ID", "Day"]).reset_index()
+          .rename(columns={"LG_ID": "Entity_ID"})
+          .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
+    )
+
+    # --- ALSO include LG stock levels for pre-days (start_day..0) with zero consumption/dispatch ---
+    # For pre-days, stock = init + cumulative(CG->LG up to that pre-day). LG->FPS = 0.
+    pre_cols = list(range(start_day, 1))  # includes negatives and 0; empty if start_day >= 1
+    if pre_cols:
+        if not dispatch_cg.empty:
+            # Reuse cg_piv if available; else build a zero frame sized LG x pre_cols
+            cg_pre = cg_piv.reindex(index=lg_ids_sorted, columns=pre_cols, fill_value=0.0)
+            cg_pre_cum = cg_pre.cumsum(axis=1)
+        else:
+            cg_pre_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=pre_cols)
+
+        stock_pre_matrix = init_series.to_numpy()[:, None] + cg_pre_cum.to_numpy()
+        stock_pre_matrix = np.where(np.abs(stock_pre_matrix) < 1e-9, 0.0, stock_pre_matrix)
+
+        lg_stock_levels_pre = (
+            pd.DataFrame(stock_pre_matrix, index=lg_ids_sorted, columns=pre_cols)
+              .stack().rename("Stock_Level_tons")
+              .rename_axis(index=["LG_ID", "Day"]).reset_index()
+              .rename(columns={"LG_ID": "Entity_ID"})
+              .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
+        )
+
+    # Append pre-day LG stocks to the main LG stock rows
+    lg_stock_levels = pd.concat([lg_stock_levels_pre, lg_stock_levels], ignore_index=True)
+    stock_levels = pd.concat(
+        [stock_levels[stock_levels["Entity_Type"] == "FPS"], lg_stock_levels],
+        ignore_index=True
+    )
 
     return dispatch_cg, dispatch_lg, stock_levels
