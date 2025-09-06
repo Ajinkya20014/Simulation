@@ -455,8 +455,33 @@ def run_simulation(
           .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
     )
 
+    # --- ALSO include LG stock levels for pre-days (start_day..0) with zero consumption/dispatch ---
+    # For pre-days, stock = init + cumulative(CG->LG up to that pre-day). LG->FPS = 0.
+    pre_cols = list(range(start_day, 1))  # includes negatives and 0; empty if start_day >= 1
+    if pre_cols:
+        if not dispatch_cg.empty:
+            # Reuse cg_piv if available; else build a zero frame sized LG x pre_cols
+            cg_pre = cg_piv.reindex(index=lg_ids_sorted, columns=pre_cols, fill_value=0.0)
+            cg_pre_cum = cg_pre.cumsum(axis=1)
+        else:
+            cg_pre_cum = pd.DataFrame(0.0, index=lg_ids_sorted, columns=pre_cols)
+
+        stock_pre_matrix = init_series.to_numpy()[:, None] + cg_pre_cum.to_numpy()
+        stock_pre_matrix = np.where(np.abs(stock_pre_matrix) < 1e-9, 0.0, stock_pre_matrix)
+
+        lg_stock_levels_pre = (
+            pd.DataFrame(stock_pre_matrix, index=lg_ids_sorted, columns=pre_cols)
+              .stack().rename("Stock_Level_tons")
+              .rename_axis(index=["LG_ID", "Day"]).reset_index()
+              .rename(columns={"LG_ID": "Entity_ID"})
+              .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
+        )
+
+    # Append pre-day LG stocks to the main LG stock rows
+    lg_stock_levels = pd.concat([lg_stock_levels_pre, lg_stock_levels], ignore_index=True)
     stock_levels = pd.concat(
         [stock_levels[stock_levels["Entity_Type"] == "FPS"], lg_stock_levels],
         ignore_index=True
     )
+
     return dispatch_cg, dispatch_lg, stock_levels
