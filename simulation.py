@@ -408,13 +408,7 @@ def run_simulation(
     # LG universe & init (INT-aligned)
     lg_ids_sorted = sorted(int(x) for x in lgs["LG_ID"].dropna().astype(int).unique())
 
-    if "Initial_Allocation_tons" in lgs.columns:
-        init_series = (
-            lgs.assign(LG_ID=lgs["LG_ID"].astype(int))
-               .set_index("LG_ID")["Initial_Allocation_tons"]
-               .reindex(lg_ids_sorted).fillna(0.0)
-        )
-    elif "Initial_LG_stock" in lgs.columns:
+    if "Initial_LG_stock" in lgs.columns:
         init_series = (
             lgs.assign(LG_ID=lgs["LG_ID"].astype(int))
                .set_index("LG_ID")["Initial_LG_stock"]
