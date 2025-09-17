@@ -76,42 +76,42 @@ def run_simulation(
         raise ValueError(f"FPS sheet missing required columns: {missing}")
 
     fps = fps.copy()
-    # Ensure lead time
+    # Ensure lead time numeric
     if "Lead_Time_days" not in fps.columns:
         fps["Lead_Time_days"] = DEFAULT_LEAD
     else:
         fps["Lead_Time_days"] = pd.to_numeric(fps["Lead_Time_days"], errors="coerce").fillna(DEFAULT_LEAD)
 
     # -----------------------------
-    # 1a) Per-commodity daily demand & shares (robust to missing columns)
+    # 1a) Per-commodity daily demand & shares (NO scalar fallbacks)
     # -----------------------------
-    # Accept either explicit monthly columns or short AYY/PHH columns
+    # Accept either explicit monthly per-commodity or short AYY/PHH columns
     if "Monthly_Demand_AYY_tons" not in fps.columns and "AYY" in fps.columns:
         fps["Monthly_Demand_AYY_tons"] = fps["AYY"]
     if "Monthly_Demand_PHH_tons" not in fps.columns and "PHH" in fps.columns:
         fps["Monthly_Demand_PHH_tons"] = fps["PHH"]
 
-    def _num_series(df: pd.DataFrame, col_name: str, default: float = 0.0) -> pd.Series:
-        """Return a numeric Series aligned to df.index; if missing, a zero Series."""
-        if col_name in df.columns:
-            return pd.to_numeric(df[col_name], errors="coerce").fillna(0.0)
-        return pd.Series(default, index=df.index, dtype="float64")
+    # Ensure columns exist as Series (avoid Series.get(..., 0) → scalar)
+    for col in ["Monthly_Demand_AYY_tons", "Monthly_Demand_PHH_tons", "Monthly_Demand_tons"]:
+        if col not in fps.columns:
+            fps[col] = 0.0  # creates a broadcast Series aligned to fps.index
 
-    ayy_monthly = _num_series(fps, "Monthly_Demand_AYY_tons")
-    phh_monthly = _num_series(fps, "Monthly_Demand_PHH_tons")
-    tot_monthly = _num_series(fps, "Monthly_Demand_tons")
+    # Now safely numeric-coerce
+    ayy_monthly = pd.to_numeric(fps["Monthly_Demand_AYY_tons"], errors="coerce").fillna(0.0)
+    phh_monthly = pd.to_numeric(fps["Monthly_Demand_PHH_tons"], errors="coerce").fillna(0.0)
+    tot_monthly = pd.to_numeric(fps["Monthly_Demand_tons"],     errors="coerce").fillna(0.0)
 
     # Daily per-commodity
     fps["Daily_Demand_AYY_tons"] = ayy_monthly / 30.0
     fps["Daily_Demand_PHH_tons"] = phh_monthly / 30.0
 
     # Total daily: prefer per-commodity sum; otherwise explicit total
-    derived_total_daily = fps["Daily_Demand_AYY_tons"] + fps["Daily_Demand_PHH_tons"]
+    derived_total_daily  = fps["Daily_Demand_AYY_tons"] + fps["Daily_Demand_PHH_tons"]
     explicit_total_daily = tot_monthly / 30.0
     fps["Daily_Demand_tons"] = derived_total_daily.where(derived_total_daily > 0, explicit_total_daily)
 
     # Thresholds (total & per-commodity)
-    fps["Reorder_Threshold_tons"]     = fps["Daily_Demand_tons"] * fps["Lead_Time_days"]
+    fps["Reorder_Threshold_tons"]     = fps["Daily_Demand_tons"]     * fps["Lead_Time_days"]
     fps["Reorder_Threshold_AYY_tons"] = fps["Daily_Demand_AYY_tons"] * fps["Lead_Time_days"]
     fps["Reorder_Threshold_PHH_tons"] = fps["Daily_Demand_PHH_tons"] * fps["Lead_Time_days"]
 
