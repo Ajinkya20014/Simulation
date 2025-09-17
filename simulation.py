@@ -18,8 +18,8 @@ def run_simulation(
         Day, Vehicle_ID, LG_ID, FPS_ID, Quantity_tons, AYY_tons, PHH_tons
       - Produces stock_levels (TOTAL stock, no commodity column) for LG & FPS (end-of-day snapshots)
 
-    Phase 2: CG → LG
-      - Uses per-LG per-day requirement derived from Phase 1 (and its AYY/PHH split)
+    Phase 2: CG → LG  (MIRROR MODE)
+      - EXACTLY mirrors per-LG, per-day totals (and AYY/PHH split) that LG shipped to FPS.
       - Produces dispatch_cg with:
         Day, Vehicle_ID, LG_ID, Quantity_tons, AYY_tons, PHH_tons
 
@@ -28,7 +28,7 @@ def run_simulation(
     """
 
     # -----------------------------
-    # 0) Read key parameters safely
+    # 0) Settings
     # -----------------------------
     def _get_setting(param_name, default=None, cast=float):
         try:
@@ -46,7 +46,7 @@ def run_simulation(
     DEFAULT_LEAD = _get_setting("Default_Lead_Time_days", cast=float)
 
     # -----------------------------
-    # 1) Prepare LG & FPS mappings
+    # 1) LG & FPS normalization
     # -----------------------------
     lgs = lgs.copy()
     if "LG_ID" not in lgs.columns or "LG_Name" not in lgs.columns:
@@ -56,66 +56,57 @@ def run_simulation(
     valid_lg_ids = set(int(x) for x in lgs["LG_ID"])
 
     def normalize_lg_ref(val):
-        """Accept either an int-like ID or a name; return int LG_ID or None."""
         if pd.isna(val):
             return None
         s = str(val).strip()
-        # Try as int
         try:
-            i = int(float(s))  # handles "5" or "5.0"
+            i = int(float(s))
             return i if i in valid_lg_ids else None
         except ValueError:
             pass
-        # Try as name
         return lgid_by_name.get(s.lower())
 
-    # FPS required columns (allow missing total monthly if per-commodity provided)
-    req_cols = {"FPS_ID", "Max_Capacity_tons", "Linked_LG_ID"}
-    missing = req_cols - set(fps.columns)
-    if missing:
-        raise ValueError(f"FPS sheet missing required columns: {missing}")
+    # FPS minimal requirements (allow Monthly_Demand_tons to be missing if per-commodity exists)
+    need_cols = {"FPS_ID", "Max_Capacity_tons", "Linked_LG_ID"}
+    miss = need_cols - set(fps.columns)
+    if miss:
+        raise ValueError(f"FPS sheet missing required columns: {miss}")
 
     fps = fps.copy()
-    # Ensure lead time numeric
-    if "Lead_Time_days" not in fps.columns:
-        fps["Lead_Time_days"] = DEFAULT_LEAD
-    else:
-        fps["Lead_Time_days"] = pd.to_numeric(fps["Lead_Time_days"], errors="coerce").fillna(DEFAULT_LEAD)
+    # Lead time
+    fps["Lead_Time_days"] = pd.to_numeric(
+        fps["Lead_Time_days"] if "Lead_Time_days" in fps.columns else DEFAULT_LEAD,
+        errors="coerce"
+    ).fillna(DEFAULT_LEAD)
 
-    # -----------------------------
-    # 1a) Per-commodity daily demand & shares (NO scalar fallbacks)
-    # -----------------------------
-    # Accept either explicit monthly per-commodity or short AYY/PHH columns
+    # Accept short aliases for monthly per-commodity
     if "Monthly_Demand_AYY_tons" not in fps.columns and "AYY" in fps.columns:
         fps["Monthly_Demand_AYY_tons"] = fps["AYY"]
     if "Monthly_Demand_PHH_tons" not in fps.columns and "PHH" in fps.columns:
         fps["Monthly_Demand_PHH_tons"] = fps["PHH"]
 
-    # Ensure columns exist as Series (avoid Series.get(..., 0) → scalar)
+    # Guarantee monthly columns exist as Series (avoid scalar fallbacks)
     for col in ["Monthly_Demand_AYY_tons", "Monthly_Demand_PHH_tons", "Monthly_Demand_tons"]:
         if col not in fps.columns:
-            fps[col] = 0.0  # creates a broadcast Series aligned to fps.index
+            fps[col] = 0.0
 
-    # Now safely numeric-coerce
+    # Daily demand
     ayy_monthly = pd.to_numeric(fps["Monthly_Demand_AYY_tons"], errors="coerce").fillna(0.0)
     phh_monthly = pd.to_numeric(fps["Monthly_Demand_PHH_tons"], errors="coerce").fillna(0.0)
     tot_monthly = pd.to_numeric(fps["Monthly_Demand_tons"],     errors="coerce").fillna(0.0)
 
-    # Daily per-commodity
     fps["Daily_Demand_AYY_tons"] = ayy_monthly / 30.0
     fps["Daily_Demand_PHH_tons"] = phh_monthly / 30.0
 
-    # Total daily: prefer per-commodity sum; otherwise explicit total
-    derived_total_daily  = fps["Daily_Demand_AYY_tons"] + fps["Daily_Demand_PHH_tons"]
     explicit_total_daily = tot_monthly / 30.0
+    derived_total_daily  = fps["Daily_Demand_AYY_tons"] + fps["Daily_Demand_PHH_tons"]
     fps["Daily_Demand_tons"] = derived_total_daily.where(derived_total_daily > 0, explicit_total_daily)
 
-    # Thresholds (total & per-commodity)
     fps["Reorder_Threshold_tons"]     = fps["Daily_Demand_tons"]     * fps["Lead_Time_days"]
     fps["Reorder_Threshold_AYY_tons"] = fps["Daily_Demand_AYY_tons"] * fps["Lead_Time_days"]
     fps["Reorder_Threshold_PHH_tons"] = fps["Daily_Demand_PHH_tons"] * fps["Lead_Time_days"]
 
-    # Attach normalized LG_ID
+    # Link FPS -> LG_ID
     fps["LG_ID"] = fps["Linked_LG_ID"].apply(normalize_lg_ref)
     if fps["LG_ID"].isna().any():
         bad = fps[fps["LG_ID"].isna()][["FPS_ID", "Linked_LG_ID"]]
@@ -127,7 +118,7 @@ def run_simulation(
     fps["LG_ID"] = fps["LG_ID"].astype(int)
 
     # -----------------------------
-    # 2) Prepare Vehicles mapping
+    # 2) Vehicles mapping
     # -----------------------------
     vehicles = vehicles.copy()
     if vehicles.empty:
@@ -152,14 +143,12 @@ def run_simulation(
             token = token.strip()
             if not token:
                 continue
-            # try ID
             try:
                 i = int(float(token))
                 if i in valid_lg_ids:
                     out.append(i); continue
             except ValueError:
                 pass
-            # try name
             mapped = normalize_lg_ref(token)
             if mapped is not None:
                 out.append(mapped)
@@ -174,7 +163,7 @@ def run_simulation(
         )
 
     # -----------------------------
-    # 3) LG → FPS SIMULATION  (adds AYY_tons / PHH_tons per row)
+    # 3) LG → FPS (with AYY/PHH on each row)
     # -----------------------------
     if "Initial_Allocation_tons" not in lgs.columns:
         lgs["Initial_Allocation_tons"] = 0.0
@@ -186,12 +175,12 @@ def run_simulation(
     stock_rows = []
 
     for day in range(1, DAYS + 1):
-        # 3a) FPS consumes daily TOTAL demand at start of day
+        # consume at FPS
         for _, r in fps.iterrows():
             fid = int(r["FPS_ID"])
             fps_stock_total[fid] = max(0.0, fps_stock_total[fid] - float(r["Daily_Demand_tons"]))
 
-        # 3b) Determine needs by total threshold vs available at LG
+        # needs list
         needs = []
         for _, r in fps.iterrows():
             fid  = int(r["FPS_ID"])
@@ -208,17 +197,16 @@ def run_simulation(
                     needs.append((urgency, fid, lgid, need_qty))
         needs.sort(reverse=True, key=lambda x: x[0])
 
-        # 3c) Reset vehicle daily usage
+        # reset daily usage
         vehicles["Trips_Used"] = 0
 
-        # 3d) Dispatch loop
+        # dispatch
         for urgency, fid, lgid, need_qty in needs:
             cand = vehicles[vehicles["Mapped_LGs_List"].apply(lambda lst: lgid in lst)].copy()
             cand = cand[cand["Trips_Used"] < MAX_TRIPS]
             if cand.empty:
                 continue
 
-            # Prefer shared vehicles
             cand["is_shared"] = cand["Mapped_LGs_List"].apply(lambda lst: len(lst) > 1)
             cand = cand.sort_values(["is_shared"], ascending=False)
             chosen = cand.iloc[0]
@@ -229,7 +217,6 @@ def run_simulation(
             if qty <= 0:
                 continue
 
-            # Split qty into AYY/PHH using this FPS's daily (or monthly) commodity mix
             r_fps = fps.loc[fps["FPS_ID"] == fid].iloc[0]
             total_daily = float(r_fps["Daily_Demand_tons"])
             if total_daily > 0:
@@ -253,12 +240,11 @@ def run_simulation(
                 "PHH_tons": float(phh_t),
             })
 
-            # Update stocks & usage
             lg_stock_total[lgid] = lg_stock_total.get(lgid, 0.0) - qty
             fps_stock_total[fid] = fps_stock_total.get(fid, 0.0) + qty
             vehicles.loc[vehicles["Vehicle_ID"] == vid, "Trips_Used"] += 1
 
-        # 3e) End-of-day stocks (TOTAL only)
+        # end-of-day stock snapshot
         for lgid, st in lg_stock_total.items():
             stock_rows.append({"Day": int(day), "Entity_Type": "LG",  "Entity_ID": int(lgid), "Stock_Level_tons": float(st)})
         for fid, st in fps_stock_total.items():
@@ -273,12 +259,9 @@ def run_simulation(
         dispatch_lg = pd.DataFrame(columns=["Day","Vehicle_ID","LG_ID","FPS_ID","Quantity_tons","AYY_tons","PHH_tons"])
 
     # -----------------------------------------------
-    # 4) Derive per-day LG requirement (and AYY/PHH split) from LG→FPS
+    # 4) Required LG inflow per day (mirror from LG→FPS)
     # -----------------------------------------------
-    required_cols = {"LG_ID", "Day", "Quantity_tons"}
-    if not required_cols.issubset(dispatch_lg.columns):
-        raise ValueError(f"dispatch_lg is missing required columns: {required_cols - set(dispatch_lg.columns)}")
-
+    # If nothing shipped LG→FPS, requirements are zeros
     if dispatch_lg.empty:
         lg_daily_req = (
             pd.MultiIndex.from_product([sorted(valid_lg_ids), range(1, DAYS + 1)], names=["LG_ID","Day"])
@@ -299,85 +282,79 @@ def run_simulation(
             })
         )
 
-    # Pivots for easy lookup
+    # Pivots for lookup
     req_pivot_total = lg_daily_req.pivot_table(index="LG_ID", columns="Day",
-                                               values="Daily_Requirement_tons",
-                                               aggfunc="sum", fill_value=0.0)
-    req_pivot_ayy = lg_daily_req.pivot_table(index="LG_ID", columns="Day",
-                                             values="Daily_Requirement_AYY_tons",
-                                             aggfunc="sum", fill_value=0.0)
-    req_pivot_phh = lg_daily_req.pivot_table(index="LG_ID", columns="Day",
-                                             values="Daily_Requirement_PHH_tons",
-                                             aggfunc="sum", fill_value=0.0)
+                                               values="Daily_Requirement_tons", aggfunc="sum", fill_value=0.0)
+    req_pivot_ayy   = lg_daily_req.pivot_table(index="LG_ID", columns="Day",
+                                               values="Daily_Requirement_AYY_tons", aggfunc="sum", fill_value=0.0)
+    req_pivot_phh   = lg_daily_req.pivot_table(index="LG_ID", columns="Day",
+                                               values="Daily_Requirement_PHH_tons", aggfunc="sum", fill_value=0.0)
 
     # -----------------------------------------------
-    # 5) CG → LG PRE-DISPATCH (TOTAL trips, per-trip AYY/PHH split)
+    # 5) CG → LG (MIRROR MODE: exact per-day totals & AYY/PHH split)
     # -----------------------------------------------
-    try:
-        cap_df = pd.read_excel(master_workbook, sheet_name="LG_Capacity")
-        if {"LG_ID","Capacity_tons"} <= set(cap_df.columns):
-            capacity = {int(r["LG_ID"]): float(r["Capacity_tons"]) for _, r in cap_df.iterrows()}
-        else:
-            raise ValueError
-    except Exception:
-        if "Storage_Capacity_tons" not in lgs.columns:
-            raise ValueError("Provide LG_Capacity sheet or 'Storage_Capacity_tons' in LGs.")
-        capacity = {int(r["LG_ID"]): float(r["Storage_Capacity_tons"]) for _, r in lgs.iterrows()}
-
-    # Optional baseline for CG→LG (TOTAL)
-    lg_stock_cg_total = {int(r["LG_ID"]): float(r.get("Initial_LG_stock", 0.0)) for _, r in lgs.iterrows()}
-
-    def free_room(lg_id: int) -> float:
-        return max(0.0, capacity.get(lg_id, 0.0) - lg_stock_cg_total.get(lg_id, 0.0))
-
     dispatch_cg_rows = []
 
-    for day in range(1, DAYS + 1):
-        trips_left = TOT_V
+    # Helper to emit trips that exactly sum to (req_total, req_ayy, req_phh)
+    def emit_mirrored_trips(day: int, lgid: int, req_total: float, req_ayy: float, req_phh: float):
+        # Cycle vehicle IDs 1..TOT_V as we create trips; ignore per-day trip cap intentionally to match totals
+        trips_needed = 0 if req_total <= 0 else int(math.floor(req_total / TRUCK_CAP))
+        rem_total = req_total
+        rem_ayy   = req_ayy
+        rem_phh   = req_phh
 
-        for lgid in req_pivot_total.index:
+        vid_counter = 0
+        # Full-capacity trips
+        while rem_total > TRUCK_CAP + 1e-9:
+            qty = TRUCK_CAP
+            denom = rem_ayy + rem_phh
+            ayy_ratio = (rem_ayy / denom) if denom > 0 else 0.0
+            ayy_t = min(qty, rem_ayy) if denom == 0 else qty * ayy_ratio
+            ayy_t = max(0.0, min(qty, ayy_t))
+            phh_t = qty - ayy_t
+
+            vid_counter = (vid_counter % TOT_V) + 1
+            dispatch_cg_rows.append({
+                "Day": int(day),
+                "Vehicle_ID": int(vid_counter),
+                "LG_ID": int(lgid),
+                "Quantity_tons": float(qty),
+                "AYY_tons": float(ayy_t),
+                "PHH_tons": float(phh_t),
+            })
+            rem_total -= qty
+            rem_ayy   -= ayy_t
+            rem_phh   -= phh_t
+
+        # Last (possibly partial) trip
+        if rem_total > 1e-9:
+            qty = rem_total
+            # Put the exact remaining split on the last trip to close any rounding drift
+            ayy_t = max(0.0, rem_ayy)
+            phh_t = max(0.0, qty - ayy_t) if rem_ayy <= qty else 0.0
+            # Boundaries
+            ayy_t = min(ayy_t, qty)
+            phh_t = qty - ayy_t
+
+            vid_counter = (vid_counter % TOT_V) + 1
+            dispatch_cg_rows.append({
+                "Day": int(day),
+                "Vehicle_ID": int(vid_counter),
+                "LG_ID": int(lgid),
+                "Quantity_tons": float(qty),
+                "AYY_tons": float(ayy_t),
+                "PHH_tons": float(phh_t),
+            })
+
+    # Emit mirrored CG→LG rows for every LG & Day
+    for lgid in req_pivot_total.index:
+        for day in range(1, DAYS + 1):
             req_total = float(req_pivot_total.at[lgid, day]) if day in req_pivot_total.columns else 0.0
             req_ayy   = float(req_pivot_ayy.at[lgid, day])   if day in req_pivot_ayy.columns   else 0.0
             req_phh   = float(req_pivot_phh.at[lgid, day])   if day in req_pivot_phh.columns   else 0.0
-
-            delivered_ayy = 0.0
-            delivered_phh = 0.0
-
-            need_today = max(0.0, req_total - lg_stock_cg_total.get(lgid, 0.0))
-            while trips_left > 0 and need_today > 1e-9:
-                vid = TOT_V - trips_left + 1
-                qty = min(TRUCK_CAP, need_today, free_room(lgid))
-                if qty <= 1e-9:
-                    break
-
-                # Split by remaining commodity requirement for TODAY
-                rem_ayy = max(0.0, req_ayy - delivered_ayy)
-                rem_phh = max(0.0, req_phh - delivered_phh)
-                denom = rem_ayy + rem_phh
-                if denom > 0:
-                    ayy_ratio = rem_ayy / denom
-                else:
-                    ayy_ratio = 0.0  # no split specified → default all PHH
-                ayy_ratio = max(0.0, min(1.0, ayy_ratio))
-                ayy_t = qty * ayy_ratio
-                phh_t = qty - ayy_t
-
-                dispatch_cg_rows.append({
-                    "Day": int(day),
-                    "Vehicle_ID": int(vid),
-                    "LG_ID": int(lgid),
-                    "Quantity_tons": float(qty),
-                    "AYY_tons": float(ayy_t),
-                    "PHH_tons": float(phh_t),
-                })
-
-                lg_stock_cg_total[lgid] = lg_stock_cg_total.get(lgid, 0.0) + qty
-                delivered_ayy += ayy_t
-                delivered_phh += phh_t
-                trips_left -= 1
-                need_today -= qty
-
-        # (Optional) Use leftover trips to pre-stock for future days if needed.
+            if req_total <= 0:
+                continue
+            emit_mirrored_trips(day, lgid, req_total, req_ayy, req_phh)
 
     dispatch_cg = pd.DataFrame(
         dispatch_cg_rows,
