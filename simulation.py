@@ -17,9 +17,9 @@ def run_simulation(
     Phase (2): CG → LG pre-dispatch (unchanged).
     Returns: (dispatch_cg, dispatch_lg, stock_levels)
 
-    NOTE: dispatch_lg now has two extra columns:
-          - AAY_Dispatched_tons
-          - PHH_Dispatched_tons
+    dispatch_lg includes:
+      - Day, Vehicle_ID, LG_ID, FPS_ID, Quantity_tons
+      - AAY_Dispatched_tons, PHH_Dispatched_tons
     """
 
     # -----------------------------
@@ -40,8 +40,7 @@ def run_simulation(
     MAX_TRIPS    = _get_setting("Max_Trips_Per_Vehicle_Per_Day", cast=int)
     DEFAULT_LEAD = _get_setting("Default_Lead_Time_days", cast=float)
 
-    # NEW: AAY/PHH per-capita monthly entitlement (kg)
-    # Defaults follow common NFSA practice, but you can override in Settings sheet.
+    # NEW: per-capita monthly entitlements (kg); override in Settings if needed
     AAY_per_card_kg        = _get_setting("AAY_per_card_kg",        default=35.0, cast=float)
     PHH_per_beneficiary_kg = _get_setting("PHH_per_beneficiary_kg", default=5.0,  cast=float)
 
@@ -60,7 +59,7 @@ def run_simulation(
             return None
         s = str(val).strip()
         try:
-            i = int(float(s))
+            i = int(float(s))                 # accepts "5" or "5.0"
             return i if i in valid_lg_ids else None
         except ValueError:
             pass
@@ -95,6 +94,7 @@ def run_simulation(
     # -----------------------------
     vehicles = vehicles.copy()
     if vehicles.empty:
+        # Fabricate fleet mapped to ALL LGs
         vehicles = pd.DataFrame({
             "Vehicle_ID": list(range(1, TOT_V + 1)),
             "Capacity_tons": [TRUCK_CAP] * TOT_V,
@@ -116,12 +116,14 @@ def run_simulation(
             token = token.strip()
             if not token:
                 continue
+            # try ID
             try:
                 i = int(float(token))
                 if i in valid_lg_ids:
                     out.append(i); continue
             except ValueError:
                 pass
+            # try name
             mapped = normalize_lg_ref(token)
             if mapped is not None:
                 out.append(mapped)
@@ -136,7 +138,7 @@ def run_simulation(
         )
 
     # -----------------------------
-    # 3) LG → FPS SIMULATION
+    # 3) LG → FPS SIMULATION (with AAY/PHH split)
     # -----------------------------
     if "Initial_Allocation_tons" not in lgs.columns:
         lgs["Initial_Allocation_tons"] = 0.0
@@ -144,16 +146,27 @@ def run_simulation(
     lg_stock  = {int(row["LG_ID"]): float(row["Initial_Allocation_tons"]) for _, row in lgs.iterrows()}
     fps_stock = {int(fid): 0.0 for fid in fps["FPS_ID"]}
 
-    # NEW: Build per-FPS monthly AAY/PHH requirements (tons) and remaining trackers
-    def _tons(kg): return float(kg) / 1000.0
+    # Vectorized kg→tons (works with scalars and pandas objects)
+    def _tons(kg):
+        if isinstance(kg, (pd.Series, pd.Index, np.ndarray)):
+            return pd.to_numeric(kg, errors="coerce") / 1000.0
+        return float(kg) / 1000.0
 
-    aay_cards = fps.get("No. of AAY Cards", pd.Series(0, index=fps.index)).fillna(0)
-    phh_bens  = fps.get("No. of PHH Benificiaries", pd.Series(0, index=fps.index)).fillna(0)
+    # Clean numeric inputs for counts (vectors aligned with fps.index)
+    if "No. of AAY Cards" in fps.columns:
+        aay_cards = pd.to_numeric(fps["No. of AAY Cards"], errors="coerce").fillna(0)
+    else:
+        aay_cards = pd.Series(0, index=fps.index, dtype=float)
+
+    if "No. of PHH Benificiaries" in fps.columns:
+        phh_bens = pd.to_numeric(fps["No. of PHH Benificiaries"], errors="coerce").fillna(0)
+    else:
+        phh_bens = pd.Series(0, index=fps.index, dtype=float)
 
     fps["AAY_Monthly_tons"] = _tons(aay_cards * AAY_per_card_kg)
     fps["PHH_Monthly_tons"] = _tons(phh_bens  * PHH_per_beneficiary_kg)
 
-    # If both are zero for an FPS, leave both at zero; otherwise they are targets
+    # Remaining requirement trackers per FPS
     aay_rem = {int(r["FPS_ID"]): float(r["AAY_Monthly_tons"]) for _, r in fps.iterrows()}
     phh_rem = {int(r["FPS_ID"]): float(r["PHH_Monthly_tons"]) for _, r in fps.iterrows()}
 
@@ -185,7 +198,7 @@ def run_simulation(
         # 3c) Reset vehicle usage counters for the day
         vehicles["Trips_Used"] = 0
 
-        # 3d) Dispatch loop (unchanged) + NEW: AAY/PHH split per trip
+        # 3d) Dispatch loop (unchanged) + strict AAY/PHH split
         for urgency, fid, lgid, need_qty in needs:
             cand = vehicles[vehicles["Mapped_LGs_List"].apply(lambda lst: lgid in lst)].copy()
             cand = cand[cand["Trips_Used"] < MAX_TRIPS]
@@ -202,33 +215,48 @@ def run_simulation(
             if qty <= 0:
                 continue
 
-            # ---- NEW: allocate this qty between AAY and PHH for this FPS (proportional to remaining) ----
+            # ---- Strict AAY/PHH allocation with caps & reflow ----
             rem_aay = max(0.0, aay_rem.get(fid, 0.0))
             rem_phh = max(0.0, phh_rem.get(fid, 0.0))
             total_rem = rem_aay + rem_phh
 
             if total_rem <= 1e-12:
-                # No remaining tagged requirement → allocate all to PHH by convention (or 0/0)
+                # No remaining tagged requirement: by convention put under PHH
                 alloc_aay = 0.0
                 alloc_phh = qty
             else:
-                # Proportional split to remaining requirement, then cap each by its remainder
-                prop_aay = rem_aay / total_rem
-                raw_aay  = qty * prop_aay
-                alloc_aay = min(raw_aay, rem_aay)
-                alloc_phh = qty - alloc_aay
-                # if PHH remainder is exceeded due to AAY cap, cap PHH too
-                alloc_phh = min(alloc_phh, rem_phh + 1e9)  # effectively no cap unless rem_phh < alloc_phh
+                # First pass: proportional share
+                aay_raw = qty * (rem_aay / total_rem)
+                phh_raw = qty - aay_raw
 
-                # Final correction: if AAY cap forced extra into PHH beyond rem_phh, keep it (business choice).
-                # If you want strict caps, uncomment the next two lines and reflow leftover to AAY:
-                # overflow = max(0.0, alloc_phh - rem_phh)
-                # alloc_phh -= overflow; alloc_aay = min(rem_aay, alloc_aay + overflow)
+                # Cap to remainders
+                alloc_aay = min(aay_raw, rem_aay)
+                alloc_phh = min(phh_raw, rem_phh)
+
+                # Reflow any leftover to the bucket(s) that still have remainder
+                leftover = qty - alloc_aay - alloc_phh
+                if leftover > 1e-12:
+                    # Try AAY first if it still has need
+                    rem_aay2 = rem_aay - alloc_aay
+                    add_aay = min(leftover, max(0.0, rem_aay2))
+                    alloc_aay += add_aay
+                    leftover  -= add_aay
+
+                    # Then PHH
+                    rem_phh2 = rem_phh - alloc_phh
+                    add_phh = min(leftover, max(0.0, rem_phh2))
+                    alloc_phh += add_phh
+                    leftover  -= add_phh
+
+                    # Any residual leftover cannot be credited to unmet targets; keep under PHH by convention
+                    if leftover > 1e-12:
+                        alloc_phh += leftover
+                        leftover = 0.0
 
             # Decrement remaining targets
             aay_rem[fid] = max(0.0, rem_aay - alloc_aay)
             phh_rem[fid] = max(0.0, rem_phh - alloc_phh)
-            # ---------------------------------------------------------------------------------------------
+            # ------------------------------------------------------
 
             dispatch_lg_rows.append({
                 "Day": int(day),
@@ -240,7 +268,7 @@ def run_simulation(
                 "PHH_Dispatched_tons": float(alloc_phh),
             })
 
-            # update stocks & vehicle usage (unchanged)
+            # Update stocks & vehicle usage
             lg_stock[lgid] = lg_stock.get(lgid, 0.0) - qty
             fps_stock[fid] = fps_stock.get(fid, 0.0) + qty
             vehicles.loc[vehicles["Vehicle_ID"] == vid, "Trips_Used"] += 1
@@ -252,9 +280,10 @@ def run_simulation(
             stock_rows.append({"Day": int(day), "Entity_Type": "FPS", "Entity_ID": int(fid),  "Stock_Level_tons": float(st)})
 
     # Build DataFrames with expected schema (+ new columns)
-    dispatch_lg = pd.DataFrame(dispatch_lg_rows,
-                               columns=["Day","Vehicle_ID","LG_ID","FPS_ID","Quantity_tons",
-                                        "AAY_Dispatched_tons","PHH_Dispatched_tons"])
+    dispatch_lg = pd.DataFrame(
+        dispatch_lg_rows,
+        columns=["Day","Vehicle_ID","LG_ID","FPS_ID","Quantity_tons","AAY_Dispatched_tons","PHH_Dispatched_tons"]
+    )
     stock_levels = pd.DataFrame(stock_rows, columns=["Day","Entity_Type","Entity_ID","Stock_Level_tons"])
 
     if dispatch_lg.empty:
@@ -413,7 +442,7 @@ def run_simulation(
 
     dispatch_cg = pd.DataFrame(rows, columns=["Day", "Vehicle_ID", "LG_ID", "Quantity_tons"])
 
-    # === LG stocks (unchanged): init + cum(CG→LG incl. pre) − cum(LG→FPS)
+    # === LG stocks: init + cum(CG→LG incl. pre) − cum(LG→FPS)
     lg_ids_sorted = sorted(int(x) for x in lgs["LG_ID"].dropna().astype(int).unique())
 
     if "Initial_LG_stock" in lgs.columns:
@@ -431,7 +460,7 @@ def run_simulation(
         dcg["Day"]   = dcg["Day"].astype(int)
         cg_piv = dcg.pivot_table(index="LG_ID", columns="Day",
                                  values="Quantity_tons", aggfunc="sum", fill_value=0.0)
-        full_cols = list(range(start_day, DAYS + 1))
+        full_cols = list(range(start_day, DAYS + 1))   # include pre-days
         cg_piv = cg_piv.reindex(index=lg_ids_sorted, columns=full_cols, fill_value=0.0)
         cg_cum = cg_piv.cumsum(axis=1).reindex(columns=list(range(1, DAYS + 1)), fill_value=0.0)
     else:
@@ -459,7 +488,7 @@ def run_simulation(
           .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
     )
 
-    pre_cols = list(range(start_day, 1))
+    pre_cols = list(range(start_day, 1))  # pre-days (could be empty)
     if pre_cols:
         if not dispatch_cg.empty:
             cg_pre = cg_piv.reindex(index=lg_ids_sorted, columns=pre_cols, fill_value=0.0)
@@ -477,6 +506,8 @@ def run_simulation(
               .rename(columns={"LG_ID": "Entity_ID"})
               .assign(Entity_Type="LG")[["Day", "Entity_Type", "Entity_ID", "Stock_Level_tons"]]
         )
+    else:
+        lg_stock_levels_pre = pd.DataFrame(columns=["Day","Entity_Type","Entity_ID","Stock_Level_tons"])
 
     lg_stock_levels = pd.concat([lg_stock_levels_pre, lg_stock_levels], ignore_index=True)
     stock_levels = pd.concat(
