@@ -71,13 +71,15 @@ def run_simulation(
         raise ValueError(f"FPS sheet missing required columns: {missing}")
 
     fps = fps.copy()
-    if "Lead_Time_days" not in fps.columns:
-        fps["Lead_Time_days"] = DEFAULT_LEAD
-    else:
-        fps["Lead_Time_days"] = fps["Lead_Time_days"].fillna(DEFAULT_LEAD)
 
-    fps["Daily_Demand_tons"]      = fps["Monthly_Demand_tons"] / 30.0
-    fps["Reorder_Threshold_tons"] = fps["Daily_Demand_tons"] * fps["Lead_Time_days"]
+    # Ensure numeric types up-front to avoid float(Series) issues later
+    for col in ["Monthly_Demand_tons", "Max_Capacity_tons", "Lead_Time_days"]:
+        if col in fps.columns:
+            fps[col] = pd.to_numeric(fps[col], errors="coerce")
+    fps["Lead_Time_days"] = fps.get("Lead_Time_days", pd.Series(np.nan, index=fps.index)).fillna(DEFAULT_LEAD)
+
+    fps["Daily_Demand_tons"]      = (fps["Monthly_Demand_tons"] / 30.0).fillna(0.0)
+    fps["Reorder_Threshold_tons"] = (fps["Daily_Demand_tons"] * fps["Lead_Time_days"]).fillna(0.0)
 
     fps["LG_ID"] = fps["Linked_LG_ID"].apply(normalize_lg_ref)
     if fps["LG_ID"].isna().any():
@@ -143,7 +145,7 @@ def run_simulation(
     if "Initial_Allocation_tons" not in lgs.columns:
         lgs["Initial_Allocation_tons"] = 0.0
 
-    lg_stock  = {int(row["LG_ID"]): float(row["Initial_Allocation_tons"]) for _, row in lgs.iterrows()}
+    lg_stock  = {int(row["LG_ID"]): row["Initial_Allocation_tons"] for _, row in lgs.iterrows()}
     fps_stock = {int(fid): 0.0 for fid in fps["FPS_ID"]}
 
     # Vectorized kg→tons (works with scalars and pandas objects)
@@ -163,12 +165,12 @@ def run_simulation(
     else:
         phh_bens = pd.Series(0, index=fps.index, dtype=float)
 
-    fps["AAY_Monthly_tons"] = _tons(aay_cards * AAY_per_card_kg)
-    fps["PHH_Monthly_tons"] = _tons(phh_bens  * PHH_per_beneficiary_kg)
+    fps["AAY_Monthly_tons"] = _tons(aay_cards * AAY_per_card_kg).fillna(0.0)
+    fps["PHH_Monthly_tons"] = _tons(phh_bens  * PHH_per_beneficiary_kg).fillna(0.0)
 
-    # Remaining requirement trackers per FPS
-    aay_rem = {int(r["FPS_ID"]): float(r["AAY_Monthly_tons"]) for _, r in fps.iterrows()}
-    phh_rem = {int(r["FPS_ID"]): float(r["PHH_Monthly_tons"]) for _, r in fps.iterrows()}
+    # Remaining requirement trackers per FPS (use raw float values)
+    aay_rem = {int(r["FPS_ID"]): r["AAY_Monthly_tons"] for _, r in fps.iterrows()}
+    phh_rem = {int(r["FPS_ID"]): r["PHH_Monthly_tons"] for _, r in fps.iterrows()}
 
     dispatch_lg_rows = []
     stock_rows = []
@@ -177,7 +179,8 @@ def run_simulation(
         # 3a) FPS consumes daily demand
         for _, r in fps.iterrows():
             fid = int(r["FPS_ID"])
-            fps_stock[fid] = max(0.0, fps_stock[fid] - float(r["Daily_Demand_tons"]))
+            # r["Daily_Demand_tons"] is numeric scalar
+            fps_stock[fid] = max(0.0, fps_stock[fid] - (r["Daily_Demand_tons"] or 0.0))
 
         # 3b) Compute needs
         needs = []
@@ -185,13 +188,14 @@ def run_simulation(
             fid  = int(r["FPS_ID"])
             lgid = int(r["LG_ID"])
             current   = fps_stock[fid]
-            threshold = float(r["Reorder_Threshold_tons"])
-            max_cap   = float(r["Max_Capacity_tons"])
+            threshold = r["Reorder_Threshold_tons"] or 0.0
+            max_cap   = r["Max_Capacity_tons"] or 0.0
             if current <= threshold:
                 available_at_lg = lg_stock.get(lgid, 0.0)
                 need_qty = min(max_cap - current, available_at_lg)
                 if need_qty > 0:
-                    urgency = (threshold - current) / float(r["Daily_Demand_tons"]) if r["Daily_Demand_tons"] > 0 else 0
+                    dd = r["Daily_Demand_tons"] or 0.0
+                    urgency = (threshold - current) / dd if dd > 0 else 0.0
                     needs.append((urgency, fid, lgid, need_qty))
         needs.sort(reverse=True, key=lambda x: x[0])
 
@@ -210,7 +214,7 @@ def run_simulation(
             chosen = cand.iloc[0]
 
             vid = chosen["Vehicle_ID"]
-            cap = float(chosen["Capacity_tons"])
+            cap = chosen["Capacity_tons"] or 0.0
             qty = min(cap, need_qty, lg_stock.get(lgid, 0.0))
             if qty <= 0:
                 continue
@@ -263,9 +267,9 @@ def run_simulation(
                 "Vehicle_ID": vid,
                 "LG_ID": int(lgid),
                 "FPS_ID": int(fid),
-                "Quantity_tons": float(qty),
-                "AAY_Dispatched_tons": float(alloc_aay),
-                "PHH_Dispatched_tons": float(alloc_phh),
+                "Quantity_tons": qty,
+                "AAY_Dispatched_tons": alloc_aay,
+                "PHH_Dispatched_tons": alloc_phh,
             })
 
             # Update stocks & vehicle usage
@@ -275,9 +279,9 @@ def run_simulation(
 
         # 3e) Record end-of-day stocks
         for lgid, st in lg_stock.items():
-            stock_rows.append({"Day": int(day), "Entity_Type": "LG",  "Entity_ID": int(lgid), "Stock_Level_tons": float(st)})
+            stock_rows.append({"Day": int(day), "Entity_Type": "LG",  "Entity_ID": int(lgid), "Stock_Level_tons": st})
         for fid, st in fps_stock.items():
-            stock_rows.append({"Day": int(day), "Entity_Type": "FPS", "Entity_ID": int(fid),  "Stock_Level_tons": float(st)})
+            stock_rows.append({"Day": int(day), "Entity_Type": "FPS", "Entity_ID": int(fid),  "Stock_Level_tons": st})
 
     # Build DataFrames with expected schema (+ new columns)
     dispatch_lg = pd.DataFrame(
