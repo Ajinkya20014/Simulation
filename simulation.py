@@ -24,9 +24,6 @@ def run_simulation(
         -> dispatch_cg columns: Day, Vehicle_ID, LG_ID, Quantity_tons
     """
 
-    # -----------------------------
-    # 0) Settings helper
-    # -----------------------------
     def _get_setting(param_name, default=None, cast=float):
         try:
             val = settings.loc[settings["Parameter"] == param_name, "Value"].iloc[0]
@@ -42,13 +39,9 @@ def run_simulation(
     MAX_TRIPS    = _get_setting("Max_Trips_Per_Vehicle_Per_Day", 3, int)
     DEFAULT_LEAD = _get_setting("Default_Lead_Time_days", 3, float)
 
-    # AAY/PHH entitlement weights (kg per month per card/beneficiary).
     AAY_per_card_kg = _get_setting("AAY_per_card_kg", 0.0, float)
     PHH_per_ben_kg  = _get_setting("PHH_per_beneficiary_kg", 0.0, float)
 
-    # -----------------------------
-    # 1) Prepare LG & FPS mappings
-    # -----------------------------
     lgs = lgs.copy()
     if "LG_ID" not in lgs.columns or "LG_Name" not in lgs.columns:
         raise ValueError("LGs sheet must contain columns: LG_ID, LG_Name")
@@ -73,15 +66,10 @@ def run_simulation(
 
     fps = fps.copy()
 
-    # ---------- SAFE NUMERIC COLUMN GETTER (never returns scalar) ----------
     def _norm(s: str) -> str:
         return "".join(ch for ch in str(s).lower() if ch.isalnum())
 
     def get_numeric_col(df: pd.DataFrame, candidates: list[str], default_value: float = 0.0) -> pd.Series:
-        """
-        Case/space/punct-insensitive column fetch.
-        Always returns a numeric Series aligned to df.index (never a scalar).
-        """
         if not isinstance(df, pd.DataFrame):
             return pd.Series([], dtype=float)
         if df.empty:
@@ -97,17 +85,13 @@ def run_simulation(
             key = _norm(cand)
             if key in lookup:
                 col = df[lookup[key]]
-                # If someone passed a constant/strange object, force to Series first
                 if not isinstance(col, pd.Series):
                     col = pd.Series(col, index=df.index)
                 ser = pd.to_numeric(col, errors="coerce")
-                # ser is Series here
                 return ser.fillna(default_value).astype(float)
 
-        # Not found -> zeros
         return pd.Series(default_value, index=df.index, dtype=float)
 
-    # Lead-time & thresholds (use safe getter)
     lead_series = get_numeric_col(fps, ["Lead_Time_days"])
     lead_series = lead_series.where(~lead_series.isna(), other=DEFAULT_LEAD).fillna(DEFAULT_LEAD)
     fps["Lead_Time_days"] = lead_series
@@ -127,7 +111,6 @@ def run_simulation(
         )
     fps["LG_ID"] = fps["LG_ID"].astype(int)
 
-    # AAY/PHH counts (robust to header variants / misspellings)
     aay_candidates = [
         "No. of AAY Cards", "No of AAY Cards", "AAY Cards", "AAY_Cards", "AAY cards",
     ]
@@ -138,7 +121,6 @@ def run_simulation(
     aay_cards = get_numeric_col(fps, aay_candidates, default_value=0.0)
     phh_bens  = get_numeric_col(fps, phh_candidates,  default_value=0.0)
 
-    # Entitlements (tons) – vectorized; guaranteed Series
     ent_aay_series = (aay_cards * float(AAY_per_card_kg)) / 1000.0
     ent_phh_series = (phh_bens  * float(PHH_per_ben_kg))  / 1000.0
 
@@ -148,9 +130,6 @@ def run_simulation(
     deliv_aay = defaultdict(float)
     deliv_phh = defaultdict(float)
 
-    # -----------------------------
-    # 2) Vehicles mapping
-    # -----------------------------
     vehicles = vehicles.copy()
     if vehicles.empty:
         vehicles = pd.DataFrame({
@@ -194,9 +173,6 @@ def run_simulation(
             f"Examples:\n{bad.head(5).to_string(index=False)}"
         )
 
-    # -----------------------------
-    # 3) LG → FPS SIMULATION
-    # -----------------------------
     if "Initial_Allocation_tons" not in lgs.columns:
         lgs["Initial_Allocation_tons"] = 0.0
     lgs["Initial_Allocation_tons"] = pd.to_numeric(lgs["Initial_Allocation_tons"], errors="coerce").fillna(0.0)
@@ -245,13 +221,11 @@ def run_simulation(
         return float(aay), float(phh)
 
     for day in range(1, DAYS + 1):
-        # consume
         for _, r in fps.iterrows():
             fid = int(r["FPS_ID"])
             consume = float(r["Daily_Demand_tons"])
             fps_stock[fid] = max(0.0, fps_stock[fid] - consume)
 
-        # needs
         needs = []
         for _, r in fps.iterrows():
             fid = int(r["FPS_ID"])
@@ -280,7 +254,7 @@ def run_simulation(
             cand = cand.sort_values(["is_shared"], ascending=False)
             chosen = cand.iloc[0]
 
-            vid = chosen["Vehicle_ID"]
+            vid = chosen["Vehicle_ID"]         # ← keep as-is (string/int), don't cast to int
             cap = float(chosen["Capacity_tons"])
             qty = min(cap, need_qty, lg_stock.get(lgid, 0.0))
             if qty <= 0:
@@ -292,7 +266,7 @@ def run_simulation(
 
             dispatch_lg_rows.append({
                 "Day": int(day),
-                "Vehicle_ID": int(vid),
+                "Vehicle_ID": vid,             # ← FIX: removed int() cast
                 "LG_ID": int(lgid),
                 "FPS_ID": int(fid),
                 "Quantity_tons": float(qty),
@@ -318,9 +292,6 @@ def run_simulation(
     if dispatch_lg.empty:
         dispatch_lg = pd.DataFrame(columns=["Day","Vehicle_ID","LG_ID","FPS_ID","Quantity_tons","AAY_Dispatched_tons","PHH_Dispatched_tons"])
 
-    # -----------------------------------------------
-    # 4) LG daily requirement
-    # -----------------------------------------------
     if dispatch_lg.empty:
         lg_daily_req = (
             pd.MultiIndex.from_product([sorted(valid_lg_ids), range(1, DAYS + 1)], names=["LG_ID","Day"])
@@ -344,9 +315,6 @@ def run_simulation(
         aggfunc="sum", fill_value=0.0
     )
 
-    # -----------------------------------------------
-    # 5) CG → LG pre-dispatch
-    # -----------------------------------------------
     try:
         cap_df = pd.read_excel(master_workbook, sheet_name="LG_Capacity")
         if {"LG_ID", "Capacity_tons"} <= set(cap_df.columns):
@@ -468,7 +436,6 @@ def run_simulation(
 
     dispatch_cg = pd.DataFrame(rows, columns=["Day", "Vehicle_ID", "LG_ID", "Quantity_tons"])
 
-    # === Accurate LG stock levels: init + cumulative(CG→LG incl. pre-days) − cumulative(LG→FPS) ===
     lg_ids_sorted = sorted(int(x) for x in pd.to_numeric(lgs["LG_ID"], errors="coerce").dropna().astype(int).unique())
 
     if "Initial_LG_stock" in lgs.columns:
