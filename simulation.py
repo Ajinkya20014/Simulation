@@ -1,5 +1,4 @@
 # simulation.py
-import io
 import math
 from collections import defaultdict
 from typing import Tuple
@@ -48,7 +47,7 @@ def run_simulation(
     MAX_TRIPS    = _get_setting("Max_Trips_Per_Vehicle_Per_Day", 3, int)
     DEFAULT_LEAD = _get_setting("Default_Lead_Time_days", 3, float)
 
-    # AAY/PHH entitlement weights (kg). Defaults kept to 0 to avoid surprises if not configured.
+    # AAY/PHH entitlement weights (kg per month per card/beneficiary).
     AAY_per_card_kg = _get_setting("AAY_per_card_kg", 0.0, float)
     PHH_per_ben_kg  = _get_setting("PHH_per_beneficiary_kg", 0.0, float)
 
@@ -106,16 +105,77 @@ def run_simulation(
     fps["LG_ID"] = fps["LG_ID"].astype(int)
 
     # -----------------------------
-    # AAY/PHH monthly entitlements per FPS (tons)
+    # Robust readers for AAY / PHH count columns
     # -----------------------------
-    # Column names from your template:
-    #   - "No. of AAY Cards"
-    #   - "No. of PHH Benificiaries"  (note the spelling)
-    aay_cards = pd.to_numeric(fps.get("No. of AAY Cards", 0), errors="coerce").fillna(0.0)
-    phh_bens = pd.to_numeric(fps.get("No. of PHH Benificiaries", 0), errors="coerce").fillna(0.0)
-    # Convert kg to tons vectorized
+    def _norm(s: str) -> str:
+        # lowercase + remove non-alnum
+        return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+    def get_numeric_col(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+        """
+        Return a numeric Series for the first matching candidate column.
+        Matching is case/space/punctuation-insensitive.
+        If not found OR if the match degenerates to a scalar, return a zero Series
+        aligned to df.index (so vector ops never break).
+        """
+        if df is None or not isinstance(df, pd.DataFrame):
+            return pd.Series([], dtype=float)
+        if df.empty:
+            return pd.Series(0.0, index=df.index, dtype=float)
+
+        # Build a normalized lookup map (first occurrence wins if duplicates normalize to same key)
+        norm_map = {}
+        for c in df.columns:
+            k = _norm(c)
+            if k not in norm_map:
+                norm_map[k] = c
+
+        for cand in candidates:
+            key = _norm(cand)
+            if key in norm_map:
+                col = df[norm_map[key]]
+                try:
+                    ser = pd.to_numeric(col, errors="coerce")
+                    if isinstance(ser, pd.Series):
+                        return ser.fillna(0.0)
+                    # Scalar or unknown -> broadcast
+                    val = 0.0
+                    try:
+                        if ser is not None and not (isinstance(ser, float) and math.isnan(ser)):
+                            val = float(ser)
+                    except Exception:
+                        val = 0.0
+                    return pd.Series(val, index=df.index, dtype=float)
+                except Exception:
+                    # Any unexpected type -> safe fallback zeros
+                    return pd.Series(0.0, index=df.index, dtype=float)
+
+        # Not found -> zeros aligned to index
+        return pd.Series(0.0, index=df.index, dtype=float)
+
+    # Common header variants (including “Benificiaries” misspelling)
+    aay_candidates = [
+        "No. of AAY Cards",
+        "No of AAY Cards",
+        "AAY Cards",
+        "AAY_Cards",
+        "AAY cards",
+    ]
+    phh_candidates = [
+        "No. of PHH Beneficiaries",
+        "No. of PHH Benificiaries",
+        "No of PHH Beneficiaries",
+        "PHH Beneficiaries",
+        "PHH Benificiaries",
+        "PHH_Beneficiaries",
+    ]
+
+    aay_cards = get_numeric_col(fps, aay_candidates)
+    phh_bens  = get_numeric_col(fps, phh_candidates)
+
+    # AAY/PHH monthly entitlements per FPS (tons), vectorized and safe
     ent_aay_series = (aay_cards * float(AAY_per_card_kg)) / 1000.0
-    ent_phh_series = (phh_bens * float(PHH_per_ben_kg)) / 1000.0
+    ent_phh_series = (phh_bens  * float(PHH_per_ben_kg))  / 1000.0
 
     # Dicts keyed by FPS_ID for quick lookup during dispatch
     ent_aay = dict(zip(fps["FPS_ID"], ent_aay_series))
@@ -190,7 +250,7 @@ def run_simulation(
     stock_rows = []
 
     # --- helper: split a trip qty into AAY/PHH by remaining entitlement
-    def split_aay_phh(fid: int, q: float) -> Tuple[float, float]:
+    def split_aay_phh(fid: int, q: float):
         if q <= 0:
             return 0.0, 0.0
         rem_aay = max(0.0, ent_aay.get(fid, 0.0) - deliv_aay[fid])
@@ -279,7 +339,6 @@ def run_simulation(
 
             # === AAY/PHH SPLIT HERE ===
             aay_t, phh_t = split_aay_phh(fid, qty)
-            # book the delivered split
             deliv_aay[fid] += aay_t
             deliv_phh[fid] += phh_t
 
